@@ -1,12 +1,12 @@
 from .cortex_pb2 import 	User, Snapshot, Pose, ColorImage, DepthImage, Feelings
 from PIL import Image
 import gzip
-import logging
+from blessings import Terminal
 import datetime as dt
 from furl import furl
 
-INT_SIZE = 4
-
+INT_SIZE=4 
+term = Terminal()
 GENDERS_RMAP = {User.Gender.FEMALE:'f',User.Gender.MALE:'m', User.Gender.OTHER:'o'}
 UNCOMPRESSED = 'uncompressed'
 COMPRESSORS = {'gzip': gzip, 'uncompressed':'uncompressed'}
@@ -31,10 +31,14 @@ class ProtoReaderDriver:
 		and then reading that many bytes and putting it in a snapshot object that was pre-defined
 		in a proto_file'''
 		snapshot_length = int.from_bytes(self.current_snapshot_length_b, byteorder="little")
-		buff = self.fd.read(snapshot_length) #TODO: consider taking less bytes at once
+		buff = self.fd.read(snapshot_length) 
 		snapshot = Snapshot()
 		snapshot.ParseFromString(buff)
 		return snapshot
+		
+	def read_all(self):
+		x = self.fd.read()
+		return self.fd.read()
 	def next_snapshot_exists(self):
 		'''this function returns True if there exists another snapshot to read, while at the same
 		time putting in the instance field that length in bytes (after reading it), if not
@@ -52,14 +56,14 @@ def find_compressor(furl_object):
     comp_kind = furl_object.args['compressor']
     if comp_kind in COMPRESSORS:
         return COMPRESSORS[comp_kind]
-    logging.error('invalid URL - Reader')
+    print(term.red('invalid URL - Reader'))
     raise ValueError(f'invalid URL: Unsupported file compression file {comp_kind}')
 
 def find_reader_driver(furl_object):
     driver = furl_object.scheme
     if driver in READER_DRIVERS:
         return READER_DRIVERS[driver]
-    logging.error('invalid URL - Reader')
+    print(term.red('invalid URL - Reader'))
     raise ValueError(f'invalid URL: Unsupported reading file format {driver}')
     
 class Reader:
@@ -89,11 +93,16 @@ class Reader:
 	def __init__(self, url):
 		ffurl = furl(url) 
 		self.compressor = find_compressor(ffurl)
+		print('X', term.red_on_white(str(ffurl.path)))
 		self.path = str(ffurl.path)[:-1] #TODO, path in furl path has extra / at the end
 		self.open_file() #can open path now, after extracting compression-type and file path
 		
 		self.reader_driver = find_reader_driver(ffurl)(self.fd) #initiating reader_driver with our file-descriptor
 		self.user = self.reader_driver.read_user_information()
+		
+	def debug_read_all(self):
+		'''debugging purposes'''
+		return self.reader_driver.read_all()
 		
 	@property
 	def user_id(self):

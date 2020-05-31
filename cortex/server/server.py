@@ -2,32 +2,28 @@ import pika
 import sys
 import os
 import json
-import logging
 import time
 import random
 import traceback
+import datetime as dt
 from ..mq import MQer
 from blessings import Terminal
 from google.protobuf.json_format import MessageToDict
+import matplotlib
+matplotlib.use("Agg")
 import numpy as np
-#import utils.render as render
-#from utils import Connection, Listener
-#from thought import Thought, render_from_bytes
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from ..parsers import AVAILABLE_PARSERS
 from .server_utils import TheUser, TheSnapshot
-#from .server_utils import JsonPrepareDriver
-THREADS_NUMBER = 5
-METADATA_LENGTH = 20
 COUNTER = 0
-logging.basicConfig()
 term = Terminal()
 
 USER_BISCUITS = {}
 USERS_INFO = {} #Has mapping from user biscuit to his information
 GENDER_MAP = {0:'m', 1:'f', 2:'o'}
 server_mq = None
+publish_function = None
 
 def get_available_parsers():
 	return "@".join(AVAILABLE_PARSERS)
@@ -72,7 +68,9 @@ class JsonPrepareDriver():
 		self.user = TheUser()
 		user_data = USERS_INFO[biscuit]
 		self.user.ParseFromString(user_data)
-		self.volume_path = '/home/user/Desktop/volume'
+		self.volume_path = '/volume/'
+	def stringify_datetime(self, datetime):
+		return str(dt.datetime.fromtimestamp(datetime / 1e3))
 		
 	def prepare_to_publish(self):
 		'''this is the main function of the driver. it takes the client-server protocol format 
@@ -80,7 +78,8 @@ class JsonPrepareDriver():
 		global COUNTER
 		to_publish = {}
 		self.prepare_user_info(to_publish)
-		to_publish['datetime'] = self.snapshot.datetime #uint_64	
+		date_string = self.stringify_datetime(self.snapshot.datetime)
+		to_publish['datetime'] = date_string 
 		self.prepare_feelings(to_publish)
 		self.prepare_color_image(to_publish)
 		self.prepare_pose(to_publish)
@@ -94,8 +93,8 @@ class JsonPrepareDriver():
 		user_gender = GENDER_MAP[self.user.gender] #gets single character
 		user_dict = MessageToDict(self.user)
 		user_dict['gender'] = user_gender
+		user_dict['birthday'] = self.stringify_datetime(user_dict['birthday'])
 		to_publish['user']=user_dict
-		print('xxxxxxxxxxxxxxxxxxxxx'+str(user_dict))
 		
 	def prepare_feelings(self, to_publish):
 		check_bad_parser_error('feelings')
@@ -106,10 +105,9 @@ class JsonPrepareDriver():
 		'''saves color_image bytes in VOLUME/UDER_ID/DATETIME/color_image_data '''
 		print(term.green_on_black(f'DEBUG RAGHD: datetime: {self.snapshot.datetime}'))
 		datetime = self.snapshot.datetime
-		path_suffix = f'/color_images/bytes/{self.user.user_id}_{datetime}'
+		path_suffix = f'color_bytes_{self.user.user_id}_{datetime}'
 		unique_img_path = self.volume_path + path_suffix
 		with open(unique_img_path, 'wb') as f:
-			print(term.green_on_white(f'type: {type(self.snapshot.color_image.data)}, length: {len(self.snapshot.color_image.data)}'))
 			f.write(self.snapshot.color_image.data)
 		color_img_dict = {}
 		color_img_dict['width']=self.snapshot.color_image.width
@@ -128,11 +126,10 @@ class JsonPrepareDriver():
 	def prepare_depth_image(self, to_publish):
 		'''saves color_image bytes in VOLUME/UDER_ID/DATETIME/depth_image_data '''
 		datetime = self.snapshot.datetime
-		path_suffix = f'/depth_images/bytes/{self.user.user_id}_{datetime}.npy'
+		path_suffix = f'depth_bytes_{self.user.user_id}_{datetime}.npy'
 		unique_depth_path = self.volume_path + path_suffix
 		depth_dict = MessageToDict(self.snapshot.depth_image)
 		float_array = depth_dict['data']
-		#float_np_array = np.array(float_array)
 		np_array = np.reshape(float_array,(depth_dict['height'],depth_dict['width']))
 		np.save(unique_depth_path,np_array, allow_pickle=False) #saving numpy 2D array
 		
@@ -154,7 +151,6 @@ DEFAULT_DRIVER = JsonPrepareDriver
 
 	
 class CortextServer(BaseHTTPRequestHandler):
-	#prepare_driver = DEFAULT_PREPARE_DRIVER()
 	def get_unique_biscuit(self, user_id):
 		if user_id in USER_BISCUITS:
 			return USER_BISCUITS[user_id]
@@ -166,7 +162,7 @@ class CortextServer(BaseHTTPRequestHandler):
 			try:
 				self.send_response(200, get_available_parsers())
 			except:
-				logging.error("Error in initiating protocol")
+				print(term.red("Error in initiating protocol"))
 				self.send_response(404)
 			finally:
 				self.end_headers()
@@ -178,28 +174,30 @@ class CortextServer(BaseHTTPRequestHandler):
 				if self.path == '/hello':
 					content_length = int(self.headers['Content-Length'])
 					user_data = self.rfile.read(content_length)
-					user_id = DEFAULT_DRIVER.get_user_id(user_data) #we need actual user ID.
+					user_id = DEFAULT_DRIVER.get_user_id(user_data )#we need actual user ID.
 					user_biscuit = self.get_unique_biscuit(user_id)
 					USER_BISCUITS[user_id] = user_biscuit
 					USERS_INFO[user_biscuit] = user_data 
+					if publish_function:
+						publish_function(user_data)
 					self.send_response(200, user_biscuit)
 					
 				elif (current_biscuit := biscuit_url(self.path)) is not None: 
 					content_length = int(self.headers['Content-Length'])
-					snapshot_data = self.rfile.read(content_length)
+					snapshot_data = self.rfile.read(content_length)					
+					if publish_function:
+						publish_function(snapshot_data)
+					elif server_mq:
+						#we need to publish to MQ instead of publishing with the given function
+						driver = DEFAULT_DRIVER(current_biscuit, snapshot_data)
+						test = driver.prepare_to_publish()
+						server_mq.create_exchange(exchange='parsers', exchange_type='fanout')
+						server_mq.publish(exchange='parsers', key='', body=test)
 					self.send_response(200)
-					driver = DEFAULT_DRIVER(current_biscuit, snapshot_data)
-					test = driver.prepare_to_publish()
-					#also needs decoupling (MQ)
-					server_mq.create_exchange(exchange='parsers', exchange_type='fanout')
-					server_mq.publish(exchange='parsers', key='', body=test)
-					#channel.exchange_declare(exchange='parsers', exchange_type='fanout')
-					#channel.basic_publish(exchange='parsers', routing_key='', body=test)
 				else:
 					print(term.red_on_white('Bad server URL'))
 					raise TypeError(self.path)
 			except Exception as e:
-				logging.error("Error in receiving data in server")
 				print(term.red(str(e)))
 				traceback.print_exc(file=sys.stdout)
 				self.send_response(404)
@@ -212,8 +210,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     pass
 
 
-def run_server(host, port, mq_url):
-
+def run_server(host, port, mq_url=None, publish=None):
 	'''The protocol is an HTTP protocol between the server and his clinets.
 	The protocol is as follows:
 	Client first sends a /config GET request in order to received the available
@@ -228,17 +225,21 @@ def run_server(host, port, mq_url):
 	a specific user_id biscuit are saved in a simple dictionary at server's
 	end.'''
 	global server_mq
+	global publish_function
+	publish_function = publish
 	address = (host, int(port))
-	server_mq = MQer(mq_url)
+	if mq_url is not None:
+		print('here')
+		server_mq = MQer(mq_url)
 	httpd = ThreadedHTTPServer(address, CortextServer)
-	logging.info('Starting Context Server.')
+	print('Starting Context Server.')
 	try:
 		httpd.serve_forever()
 	except KeyboardInterrupt:
-		logging.info('Server Interrupted.')
+		print('Server Interrupted.')
 		pass
 	httpd.server_close()
-	logging.info('Stopped Server.')
+	print('Stopped Server.')
 
 
 if __name__ == '__main__':
